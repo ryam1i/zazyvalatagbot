@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 DB_FILE = "users.db"
 BACKUP_DIR = "backups"
 COOLDOWN_SECONDS = 60
-ALL_EMOJIS = list(emoji.EMOJI_DATA.keys())
+ALL_EMOJIS = [e for e, data in emoji.EMOJI_DATA.items() if data.get("status") == emoji.STATUS["fully_qualified"]]
 USER_COOLDOWNS: dict[int, float] = {}
 BUTTON_COOLDOWNS: dict[int, float] = {}
 TRACKED_USERS_CACHE: dict[tuple[int, int], float] = {}
@@ -125,21 +125,25 @@ def upsert_user(chat_id: int, user_id: int, username: Optional[str], first_name:
 def get_user_batches(chat_id: int, batch_size: int = 5) -> list[list[ChatMember]]:
     with db_cursor() as cur:
         cur.execute(
-            'SELECT user_id, username, first_name, emoji FROM users WHERE chat_id = ? AND (is_unregistered IS NULL OR is_unregistered = 0)',
-            (chat_id,)
-        )
+        'SELECT user_id, username, first_name, emoji FROM users '
+        'WHERE chat_id = ? AND (is_unregistered IS NULL OR is_unregistered = 0) '
+        'LIMIT 50',
+        (chat_id,)
+    )
         all_rows = cur.fetchall()
         members = [ChatMember(*row) for row in all_rows]
         return [members[i:i + batch_size] for i in range(0, len(members), batch_size)]
 
-def set_user_emoji(chat_id: int, user_id: int, emoji_str: str) -> None:
+def set_user_emoji(chat_id: int, user_id: int, emoji_str: str) -> bool:
     with db_cursor() as cur:
+        res = cur.execute(
+            'SELECT 1 FROM users WHERE chat_id = ? AND emoji = ? AND user_id != ? AND (is_unregistered IS NULL OR is_unregistered = 0)',
+            (chat_id, emoji_str, user_id)
+        ).fetchone()
+        if res:
+            return False
         cur.execute('UPDATE users SET emoji = ? WHERE chat_id = ? AND user_id = ?', (emoji_str, chat_id, user_id))
-
-def is_emoji_taken_by_others(chat_id: int, user_id: int, emoji_str: str) -> bool:
-    with db_cursor() as cur:
-        res = cur.execute('SELECT 1 FROM users WHERE chat_id = ? AND emoji = ? AND user_id != ? AND (is_unregistered IS NULL OR is_unregistered = 0)', (chat_id, emoji_str, user_id)).fetchone()
-        return bool(res)
+        return True
 
 def remove_user(chat_id: int, user_id: int) -> None:
     with db_cursor() as cur:
@@ -166,7 +170,14 @@ def delete_chat(chat_id: int) -> None:
 
 def migrate_chat_id(old_chat_id: int, new_chat_id: int) -> None:
     with db_cursor() as cur:
+        cur.execute('DELETE FROM chats WHERE chat_id = ?', (new_chat_id,))
         cur.execute('UPDATE chats SET chat_id = ?, chat_type = "supergroup" WHERE chat_id = ?', (new_chat_id, old_chat_id))
+
+        cur.execute('''
+            DELETE FROM users 
+            WHERE chat_id = ? AND user_id IN (SELECT user_id FROM users WHERE chat_id = ?)
+        ''', (old_chat_id, new_chat_id))
+
         cur.execute('UPDATE users SET chat_id = ? WHERE chat_id = ?', (new_chat_id, old_chat_id))
 
 def get_all_group_chats() -> list[int]:
@@ -273,7 +284,7 @@ TRANSLATIONS = {
             "It is developed and maintained entirely on enthusiasm.\n\n"
             "If you'd like to support server maintenance and future development, "
             "you can send Telegram Stars ⭐ below:\n\n"
-            "<i>Want to donate more? Simply reply to this message with any number of Stars (e.g. 150 or 500).</i>"
+            "<i>Want to donate more? Simply reply to this message with any number of Stars under 10,000 (e.g. 150 or 500).</i>"
         ),
         "support_stars_25": "⭐ 25 Stars",
         "support_stars_50": "⭐ 50 Stars",
@@ -282,6 +293,7 @@ TRANSLATIONS = {
         "support_invoice_title": "Support Zazyvala Tag Bot",
         "support_invoice_desc": "Donation of {amount} Telegram Stars ❤️",
         "support_invoice_label": "Project Support",
+        "support_start_pm": "Please start a private chat with @{bot_username} first so I can send you the invoice.",
         "payment_success": "🎉 <b>Thank you so much for your support!</b>\n\nReceived {stars} Telegram Stars ❤️",
         "payment_error": "Payment could not be processed."
     },
@@ -319,7 +331,7 @@ TRANSLATIONS = {
             "Он разрабатывается и поддерживается исключительно на энтузиазме.\n\n"
             "Если вы хотите поддержать оплату серверов и дальнейшую разработку, "
             "вы можете отправить Telegram Stars ⭐ ниже:\n\n"
-            "<i>Хотите отправить больше? Просто ответьте на это сообщение любым количеством Звёзд (например, 150 или 500).</i>"
+            "<i>Хотите отправить больше? Просто ответьте на это сообщение любым количеством Звёзд до 10 000 (например, 150 или 500).</i>"
         ),
         "support_stars_25": "⭐ 25 Звёзд",
         "support_stars_50": "⭐ 50 Звёзд",
@@ -328,6 +340,7 @@ TRANSLATIONS = {
         "support_invoice_title": "Поддержка Zazyvala Tag Bot",
         "support_invoice_desc": "Донат в размере {amount} Telegram Stars ❤️",
         "support_invoice_label": "Поддержка проекта",
+        "support_start_pm": "Пожалуйста, сначала начните диалог с @{bot_username} в личных сообщениях, чтобы получить счёт.",
         "payment_success": "🎉 <b>Большое спасибо за вашу поддержку!</b>\n\nПолучено {stars} Telegram Stars ❤️",
         "payment_error": "Не удалось обработать платёж."
     }
@@ -442,7 +455,7 @@ async def send_user_mentions(update: Update, chat_id: int, lang: str, prefix_tex
                 logger.error(f"Failed to send mentions in chat {chat_id}: {ex}")
                 break
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.25)
 
 
 
@@ -471,8 +484,8 @@ async def track_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     TRACKED_USERS_CACHE[cache_key] = now
     if len(TRACKED_USERS_CACHE) > 5000:
-        expired = [k for k, t in TRACKED_USERS_CACHE.items() if now - t > 600]
-        for k in expired:
+        oldest_keys = sorted(TRACKED_USERS_CACHE, key=TRACKED_USERS_CACHE.get)[:1000]
+        for k in oldest_keys:
             del TRACKED_USERS_CACHE[k]
 
     await run_db(
@@ -510,6 +523,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 @group_only
 @user_cooldown(3)
 async def unreg_command(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> None:
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    TRACKED_USERS_CACHE.pop((chat_id, user_id), None)
+
     await run_db(remove_user, update.effective_chat.id, update.effective_user.id)
     await update.effective_message.reply_text(TRANSLATIONS[lang]["unreg_success"])
 
@@ -530,11 +549,10 @@ async def setme_command(update: Update, context: ContextTypes.DEFAULT_TYPE, lang
         await update.effective_message.reply_text(TRANSLATIONS[lang]["invalid_emoji"])
         return
 
-    if await run_db(is_emoji_taken_by_others, chat_id, user_id, chosen_emoji):
+    if not await run_db(set_user_emoji, chat_id, user_id, chosen_emoji):
         await update.effective_message.reply_text(TRANSLATIONS[lang]["emoji_taken"])
         return
 
-    await run_db(set_user_emoji, chat_id, user_id, chosen_emoji)
     await update.effective_message.reply_text(TRANSLATIONS[lang]["setme_success"].format(emoji=chosen_emoji))
 
 @group_only
@@ -594,13 +612,13 @@ async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.effective_message.reply_text(TRANSLATIONS[lang]["lang_choose"], reply_markup=reply_markup)
 
-async def send_star_invoice(chat_id: int, amount: int, context: ContextTypes.DEFAULT_TYPE, lang: str = "ru") -> None:
+async def send_star_invoice(chat_id: int, amount: int, context: ContextTypes.DEFAULT_TYPE, lang: str = "en") -> None:
     prices = [LabeledPrice(label=TRANSLATIONS[lang]["support_invoice_label"], amount=amount)]
     await context.bot.send_invoice(
         chat_id=chat_id,
         title=TRANSLATIONS[lang]["support_invoice_title"],
         description=TRANSLATIONS[lang]["support_invoice_desc"].format(amount=amount),
-        payload=f"support_stars_{amount}",
+        payload=f"support_stars_{amount}_{lang}",
         currency="XTR",
         prices=prices,
         provider_token=""
@@ -641,30 +659,53 @@ async def custom_stars_reply_handler(update: Update, context: ContextTypes.DEFAU
         return
 
     text = (update.effective_message.text or "").strip()
-    if len(text) > 5:
+    match = re.search(r'\b\d+\b', text)
+    if not match:
         return
-    if text.isdigit():
-        amount = int(text)
-        if 100 < amount <= 25000:
-            lang = get_user_or_chat_lang(update, context)
-            await send_star_invoice(update.effective_chat.id, amount, context, lang=lang)
+    
+    amount = int(match.group())
+    if 1 < amount <= 9999:
+        lang = get_user_or_chat_lang(update, context)
+        user_id = update.effective_user.id if update.effective_user else None
+        if not user_id:
+            return
+        is_group = update.effective_chat and update.effective_chat.type in ['group', 'supergroup']
+        target_chat_id = user_id if is_group else update.effective_chat.id
+        try:
+            await send_star_invoice(target_chat_id, amount, context, lang=lang)
+        except (Forbidden, BadRequest) as e:
+            logger.warning(f"Failed to send custom star invoice to {target_chat_id}: {e}")
+            if is_group:
+                bot_username = context.bot.username
+                if not bot_username:
+                    try:
+                        me = await context.bot.get_me()
+                        bot_username = me.username
+                    except Exception:
+                        bot_username = "zazyvalatagbot"
+                alert_text = TRANSLATIONS[lang]["support_start_pm"].format(bot_username=bot_username)
+                await update.effective_message.reply_text(alert_text)
+        except Exception as e:
+            logger.error(f"Failed to send custom star invoice: {e}")
 
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.pre_checkout_query
     if not query:
         return
+    parts = query.invoice_payload.split("_")
+    lang = parts[3] if len(parts) >= 4 and parts[3] in TRANSLATIONS else get_user_or_chat_lang(update, context)
     if query.invoice_payload.startswith("support_stars_"):
         await query.answer(ok=True)
     else:
-        lang = get_user_or_chat_lang(update, context)
         await query.answer(ok=False, error_message=TRANSLATIONS[lang]["payment_error"])
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_message.successful_payment or not update.effective_chat:
         return
     stars = update.effective_message.successful_payment.total_amount
-    chat_id = update.effective_chat.id
-    lang = get_user_or_chat_lang(update, context)
+    payload = update.effective_message.successful_payment.invoice_payload or ""
+    parts = payload.split("_")
+    lang = parts[3] if len(parts) >= 4 and parts[3] in TRANSLATIONS else get_user_or_chat_lang(update, context)
     await update.effective_message.reply_text(
         TRANSLATIONS[lang]["payment_success"].format(stars=stars),
         parse_mode="HTML"
@@ -681,11 +722,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if query.data.startswith("donate_stars_"):
-        await query.answer()
         user_id = query.from_user.id
         now = time.time()
 
         if now - BUTTON_COOLDOWNS.get(user_id, 0) < 10:
+            await query.answer()
             return
         BUTTON_COOLDOWNS[user_id] = now
 
@@ -694,14 +735,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for uid in expired:
                 del BUTTON_COOLDOWNS[uid]
         amount = int(query.data.split("_")[-1])
-        chat_id = query.message.chat.id
         lang = get_user_or_chat_lang(update, context)
         try:
-            await send_star_invoice(query.message.chat.id, amount, context, lang=lang)
+            await send_star_invoice(user_id, amount, context, lang=lang)
+            await query.answer()
+        except (Forbidden, BadRequest) as e:
+            logger.warning(f"Could not send invoice to user {user_id} in PM: {e}")
+            bot_username = context.bot.username
+            if not bot_username:
+                try:
+                    me = await context.bot.get_me()
+                    bot_username = me.username
+                except Exception:
+                    bot_username = "zazyvalatagbot"
+            alert_text = TRANSLATIONS[lang]["support_start_pm"].format(bot_username=bot_username)
+            await query.answer(text=alert_text, show_alert=True)
         except RetryAfter as e:
             logger.warning(f"Rate limited on invoice: {e.retry_after}s")
+            await query.answer(text=TRANSLATIONS[lang]["cooldown"].format(remaining=int(e.retry_after)), show_alert=True)
         except Exception as e:
             logger.error(f"Failed to send invoice: {e}")
+            await query.answer()
         return
 
     if not query.data.startswith("lang_"):
@@ -832,7 +886,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 break
             except BadRequest as e:
                 err_msg = str(e).lower()
-                if any(x in err_msg for x in ["chat not found", "chat was deactivated", "chat was deleted", "have no rights"]):
+                if any(x in err_msg for x in ["chat not found", "chat was deactivated", "chat was deleted"]):
                     logger.warning(f"Chat {chat_id} is no longer accessible ({e}). Removing from database.")
                     await run_db(delete_chat, chat_id)
                     chat_removed = True
