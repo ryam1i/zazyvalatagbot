@@ -1,9 +1,11 @@
 from __future__ import annotations
 import os
 from typing import Optional, NamedTuple
+from dataclasses import dataclass, field
 import sqlite3
 import logging
 import random
+import secrets
 import emoji
 import time
 import re
@@ -54,6 +56,9 @@ logger = logging.getLogger(__name__)
 DB_FILE = "users.db"
 BACKUP_DIR = "backups"
 COOLDOWN_SECONDS = 60
+RANDOM_QUEUE_COOLDOWN_SECONDS = 3600
+RANDOM_QUEUE_REGISTRATION_SECONDS = 900
+RANDOM_BUTTON_THROTTLE_SECONDS = 1.3
 ALL_EMOJIS = [e for e, data in emoji.EMOJI_DATA.items() if data.get("status") == emoji.STATUS["fully_qualified"]]
 USER_COOLDOWNS: dict[int, float] = {}
 BUTTON_COOLDOWNS: dict[int, float] = {}
@@ -64,6 +69,18 @@ class ChatMember(NamedTuple):
     username: Optional[str]
     first_name: Optional[str]
     emoji: Optional[str] = None
+
+@dataclass
+class RandomSession:
+    chat_id: int
+    message_id: int
+    start_time: float
+    duration: int
+    participants: dict[int, ChatMember] = field(default_factory=dict)
+    task: Optional[asyncio.Task] = None
+    last_edit_time: float = 0.0
+
+ACTIVE_RANDOM_SESSIONS: dict[int, RandomSession] = {}
 
 @contextmanager
 def db_cursor(db_file: str = DB_FILE):
@@ -596,6 +613,142 @@ async def call_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     prefix = clean_text if clean_text else None
     await send_user_mentions(update, update.effective_chat.id, lang, prefix_text=prefix)
 
+def get_random_keyboard(count: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🙋‍♂️ Who wants to participate? Me! ({count})", callback_data="random_join")],
+        [InlineKeyboardButton("⚡️ Finish now (Admin only)", callback_data="random_finish_early")]
+    ])
+
+def fetch_users_emojis(chat_id: int, user_ids: list[int]) -> dict[int, str]:
+    if not user_ids:
+        return {}
+    placeholders = ",".join("?" for _ in user_ids)
+    with db_cursor() as cur:
+        query = f"SELECT user_id, emoji FROM users WHERE chat_id = ? AND user_id IN ({placeholders}) AND emoji IS NOT NULL"
+        rows = cur.execute(query, [chat_id, *user_ids]).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+async def finish_random_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    session = ACTIVE_RANDOM_SESSIONS.pop(chat_id, None)
+    if not session:
+        return
+
+    if session.task and not session.task.done():
+        session.task.cancel()
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=session.message_id,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Registration closed", callback_data="random_closed")]])
+        )
+    except Exception:
+        pass
+
+    users = list(session.participants.values())
+    if not users:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⏳ Time is up! No one joined the queue."
+            )
+        except Exception as e:
+            logger.error(f"Failed to send empty queue message: {e}")
+        return
+
+    user_ids = [u.user_id for u in users]
+    emojis_map = await run_db(fetch_users_emojis, chat_id, user_ids)
+
+    shuffled = list(users)
+    secrets.SystemRandom().shuffle(shuffled)
+
+    lines = ["🎲 <b>Random queue:</b>\n"]
+    for idx, u in enumerate(shuffled, start=1):
+        user_emoji = emojis_map.get(u.user_id) or u.emoji or random.choice(ALL_EMOJIS)
+        name = html.escape(u.first_name or "Member")
+        username_str = f" (@{html.escape(u.username)})" if u.username else ""
+        mention = f'<a href="tg://user?id={u.user_id}">{name}</a>{username_str}'
+        lines.append(f"{idx}. {user_emoji} {mention}")
+
+    current_chunk = ""
+    for line in lines:
+        if len(current_chunk) + len(line) + 1 > 4000:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=current_chunk.strip(), parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Failed to send queue chunk: {e}")
+            current_chunk = line + "\n"
+        else:
+            current_chunk += line + "\n"
+
+    if current_chunk:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=current_chunk.strip(), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed to send queue message: {e}")
+
+def enforce_random_cooldown(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None) -> tuple[bool, int]:
+    if user_id and is_admin(user_id):
+        return True, 0
+    now = time.time()
+    last_call = context.chat_data.get("last_random_call", 0)
+    time_passed = now - last_call
+    if time_passed < RANDOM_QUEUE_COOLDOWN_SECONDS:
+        return False, int(RANDOM_QUEUE_COOLDOWN_SECONDS - time_passed)
+    context.chat_data["last_random_call"] = now
+    return True, 0
+
+@group_only
+async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if not chat or not message or not user:
+        return
+
+    now = time.time()
+    if chat.id in ACTIVE_RANDOM_SESSIONS:
+        existing = ACTIVE_RANDOM_SESSIONS[chat.id]
+        time_left = max(1, int(existing.duration - (now - existing.start_time)))
+        mins, secs = divmod(time_left, 60)
+        await message.reply_text(
+            f"⚠️ Registration is already in progress! {mins:02d}:{secs:02d} left. Click the button in the message above ☝️"
+        )
+        return
+
+    allowed, remaining = enforce_random_cooldown(context, user.id)
+    if not allowed:
+        remaining_minutes = max(1, remaining // 60)
+        await message.reply_text(
+            f"🎲 A random queue was already generated recently! Please wait {remaining_minutes} min before starting a new one."
+        )
+        return
+
+    sent_msg = await message.reply_text(
+        "🎲 <b>Who wants to participate?</b>\n\n"
+        "Click the button below to join the queue.\n"
+        "⏳ Registration is open for <b>15 minutes</b>, after which a randomized queue will be generated!",
+        parse_mode="HTML",
+        reply_markup=get_random_keyboard(0)
+    )
+
+    session = RandomSession(
+        chat_id=chat.id,
+        message_id=sent_msg.message_id,
+        start_time=now,
+        duration=RANDOM_QUEUE_REGISTRATION_SECONDS
+    )
+    ACTIVE_RANDOM_SESSIONS[chat.id] = session
+
+    async def _timer():
+        try:
+            await asyncio.sleep(RANDOM_QUEUE_REGISTRATION_SECONDS)
+            await finish_random_session(chat.id, context)
+        except asyncio.CancelledError:
+            pass
+
+    session.task = asyncio.create_task(_timer())
+
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_chat or not update.effective_message:
         return
@@ -719,6 +872,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if query.data == "open_support":
         await query.answer()
         await support_command(update, context)
+        return
+
+    if query.data == "random_closed":
+        await query.answer("Registration is already closed!", show_alert=True)
+        return
+
+    if query.data == "random_finish_early":
+        if not is_admin(query.from_user.id):
+            await query.answer("⛔️ Only the bot creator can finish early!", show_alert=True)
+            return
+        await query.answer("⚡️ Finishing registration early...")
+        await finish_random_session(query.message.chat_id, context)
+        return
+
+    if query.data == "random_join":
+        chat_id = query.message.chat_id
+        session = ACTIVE_RANDOM_SESSIONS.get(chat_id)
+        if not session:
+            await query.answer("Registration has already expired.", show_alert=True)
+            return
+
+        user = query.from_user
+        user_id = user.id
+
+        if user_id in session.participants:
+            del session.participants[user_id]
+            alert_text = "You left the queue."
+        else:
+            session.participants[user_id] = ChatMember(
+                user_id=user_id,
+                username=user.username,
+                first_name=user.first_name,
+                emoji=None
+            )
+            alert_text = "You have joined the queue! 🎯"
+
+        await query.answer(alert_text)
+
+        now = time.time()
+        if now - session.last_edit_time > RANDOM_BUTTON_THROTTLE_SECONDS:
+            session.last_edit_time = now
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=get_random_keyboard(len(session.participants))
+                )
+            except BadRequest:
+                pass
         return
 
     if query.data.startswith("donate_stars_"):
@@ -1030,6 +1230,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("all", all_command))
+    application.add_handler(CommandHandler("random", random_command))
 
     application.add_handler(MessageHandler(filters.Regex(r'(?i)^/?(call|калл)(?:@\w+)?(?:\s|$)'), call_text_command))
     application.add_handler(MessageHandler(filters.Regex(r'(?i)^/?(unreg|анрег)(?:@\w+)?(?:\s|$)'), unreg_command))
