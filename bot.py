@@ -615,8 +615,8 @@ async def call_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 def get_random_keyboard(count: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🙋‍♂️ Who wants to participate? Me! ({count})", callback_data="random_join")],
-        [InlineKeyboardButton("⚡️ Finish now (Admin only)", callback_data="random_finish_early")]
+        [InlineKeyboardButton(f"🙋‍♂️ Join! ({count})", callback_data="random_join")],
+        [InlineKeyboardButton("⚡️ Finish now", callback_data="random_finish_early")]
     ])
 
 def fetch_users_emojis(chat_id: int, user_ids: list[int]) -> dict[int, str]:
@@ -633,7 +633,8 @@ async def finish_random_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE
     if not session:
         return
 
-    if session.task and not session.task.done():
+    current_task = asyncio.current_task()
+    if session.task and session.task != current_task and not session.task.done():
         session.task.cancel()
 
     try:
@@ -726,7 +727,7 @@ async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE, lan
 
     sent_msg = await message.reply_text(
         "🎲 <b>Who wants to participate?</b>\n\n"
-        "Click the button below to join the queue.\n"
+        "👇 Click the button below to join the queue.\n"
         "⏳ Registration is open for <b>15 minutes</b>, after which a randomized queue will be generated!",
         parse_mode="HTML",
         reply_markup=get_random_keyboard(0)
